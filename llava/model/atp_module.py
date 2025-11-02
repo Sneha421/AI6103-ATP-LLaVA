@@ -219,7 +219,6 @@ class ATPModule(nn.Module):
         if training:
             # Training: soft masks for gradient flow
             Mask_final = self.generate_soft_mask(S_redundant, S_spatial, theta_r, theta_s)
-            
             return {
                 'vision_tokens': vision_tokens,  # Keep ALL tokens
                 'text_tokens': text_tokens,
@@ -272,3 +271,144 @@ class ATPModule(nn.Module):
                     'pruning_ratio': 1.0 - (pruned_vision_tokens.shape[1] / L_v)
                 }
             }
+
+class ATPLoss(nn.Module):
+    """
+    Budget-Constrained Loss for ATP Module Training (Section 3.3.3 in paper).
+    
+    PURPOSE:
+    Train the ATP module to balance two competing objectives:
+    1. Prune as many tokens as possible (reduce computation)
+    2. Keep enough tokens to maintain performance (minimize accuracy loss)
+    
+    The loss encourages the model to learn WHEN to prune aggressively vs. conservatively
+    based on the instance and layer.
+    
+    Key Components:
+    - L_atp: Penalty for keeping too many tokens (increases with layer depth)
+    - L_target: Penalty for deviating from target token count
+    - L_ntp: Next Token Prediction loss (standard LLM loss, not implemented here)
+    """
+    
+    def __init__(
+        self,
+        lambda_atp=0.05,
+        lambda_target=0.2,
+        target_tokens=144,
+        initial_vision_tokens=576,
+    ):
+        """
+        Args:
+            lambda_atp: Weight for ATP penalty term (default: 0.05)
+            lambda_target: Weight for target constraint term (default: 0.2)
+            target_tokens: Target average number of tokens to keep (default: 144)
+            initial_vision_tokens: Initial number of vision tokens (default: 576)
+        """
+        super().__init__()
+        self.lambda_atp = lambda_atp
+        self.lambda_target = lambda_target
+        self.target_tokens = target_tokens
+        self.initial_vision_tokens = initial_vision_tokens
+    
+    def compute_atp_penalty(self, masks, layer_indices):
+        """
+        Compute ATP penalty term (Equation 12 in paper).
+        
+        L_atp = Σ (kept_tokens / 576) * layer_index
+        
+        WHY THIS FORMULA?
+        - Penalizes keeping many tokens: (kept_tokens / 576)
+        - Penalizes keeping tokens in deeper layers: * layer_index
+        - Deeper layers should prune more aggressively since visual info
+          has already been processed into text representations
+        
+        Args:
+            masks: List of soft masks [batch, L_v] from each ATP layer
+            layer_indices: List of layer indices where ATP is applied (e.g., [4, 14, 24])
+            
+        Returns:
+            atp_penalty: Scalar tensor
+        """
+        total_penalty = 0.0
+        
+        for mask, layer_idx in zip(masks, layer_indices):
+            # Sum mask values to get "number" of kept tokens (soft count)
+            kept_tokens = mask.sum(dim=1).mean()  # Average across batch
+
+            # Normalize by initial token count and weight by layer depth
+            penalty = (kept_tokens / self.initial_vision_tokens) * layer_idx
+            total_penalty += penalty
+        
+        return total_penalty
+    
+    def compute_target_constraint(self, masks):
+        """
+        Compute target constraint loss (Equation 13 in paper).
+        
+        L_target = |N - N_target|
+        
+        WHERE:
+        - N: Average number of kept tokens across all ATP layers
+        - N_target: Target token count (e.g., 144)
+        
+        WHY?
+        Constrains the AVERAGE token count to match a specific budget.
+        This prevents the model from either:
+        - Keeping too many tokens (defeats the purpose)
+        - Pruning too aggressively (hurts performance)
+        
+        Args:
+            masks: List of soft masks [batch, L_v] from each ATP layer
+            
+        Returns:
+            target_loss: Scalar tensor
+        """
+        # Compute average kept tokens across all ATP layers
+        total_kept = 0.0
+        for mask in masks:
+            kept_tokens = mask.sum(dim=1).mean()  # Average across batch
+            total_kept += kept_tokens
+        
+        avg_kept = total_kept / len(masks)
+        
+        # L1 distance from target
+        target_loss = torch.abs(avg_kept - self.target_tokens)
+        
+        return target_loss
+    
+    def forward(self, masks, layer_indices):
+        """
+        Compute total ATP loss (Equation 14 in paper).
+        
+        L = L_ntp + λ_atp * L_atp + λ_target * L_target
+        
+        NOTE: L_ntp (next token prediction) is the standard LLM loss computed
+        separately. This function only returns the ATP-specific losses.
+        
+        Args:
+            masks: List of soft masks [batch, L_v] from each ATP layer
+            layer_indices: List of layer indices where ATP is applied
+            
+        Returns:
+            loss_dict: Dictionary with individual loss components
+        """
+        # === Equation 12: ATP Penalty ===
+        atp_penalty = self.compute_atp_penalty(masks, layer_indices)
+        
+        # === Equation 13: Target Constraint ===
+        target_loss = self.compute_target_constraint(masks)
+        
+        # === Equation 14: Combined ATP Loss ===
+        total_atp_loss = (
+            self.lambda_atp * atp_penalty + 
+            self.lambda_target * target_loss
+        )
+        
+        return {
+            'atp_penalty': atp_penalty,
+            'target_loss': target_loss,
+            'total_atp_loss': total_atp_loss,
+            'lambda_atp': self.lambda_atp,
+            'lambda_target': self.lambda_target,
+        }
+
