@@ -3,36 +3,85 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 class ATPModule(nn.Module):
     """
-    Adaptive Token Pruning Module
+    Adaptive Token Pruning Module from ATP-LLaVA paper.
     
-    Inserts between LLM decoder layers to adaptively prune vision tokens.
+    Inserts between LLM decoder layers to adaptively prune vision tokens
+    based on redundancy and spatial importance scores.
     """
     
-    def __init__(self, hidden_dim=4096, lambda_sample=3.0, temperature=10.0):
+    def __init__(self, hidden_dim=4096, lambda_sample=3.0, temperature=10.0, 
+                 sampling_rate=0.25, layer_idx=None, total_layers=32):
         """
         Args:
             hidden_dim: Hidden dimension of tokens (D)
-            lambda_sample: Scaling coefficient for spatial pruning
-            temperature: Temperature for soft mask sigmoid
+            lambda_sample: Scaling coefficient for spatial pruning (default: 3.0)
+            temperature: Temperature for soft mask sigmoid (default: 10.0)
+            sampling_rate: Ratio of tokens to sample uniformly (default: 0.25)
+                          If None and layer_idx provided, uses layer-adaptive rate
+            layer_idx: Current layer index (0-31 for LLaMA-7B)
+            total_layers: Total number of layers in LLM (default: 32)
         """
         super().__init__()
         
         self.hidden_dim = hidden_dim
         self.lambda_sample = lambda_sample
         self.temperature = temperature
+        self.layer_idx = layer_idx
+        self.total_layers = total_layers
         
-        # Learnable threshold prediction heads
-        # Input: concatenated mean scores [S_self_mean, S_cross_mean]
+        # Determine sampling rate (layer-adaptive if layer_idx provided)
+        if sampling_rate is None and layer_idx is not None:
+            self.sampling_rate = self._get_layer_adaptive_sampling_rate(layer_idx, total_layers)
+        else:
+            self.sampling_rate = sampling_rate if sampling_rate is not None else 0.25
+        
+        # Learnable threshold prediction heads (Eq. 6-8)
         self.score_projection = nn.Linear(2, hidden_dim)
         self.redundant_threshold_head = nn.Linear(hidden_dim, 1)
         self.spatial_threshold_head = nn.Linear(hidden_dim, 1)
+    
+    @staticmethod
+    def _get_layer_adaptive_sampling_rate(layer_idx, total_layers):
+        """
+        Compute layer-adaptive sampling rate based on layer depth.
+        
+        Strategy: Shallow layers need more spatial info, deep layers can be pruned more.
+        
+        Args:
+            layer_idx: Current layer (0-indexed)
+            total_layers: Total layers in model
+            
+        Returns:
+            sampling_rate: Float in [0.0625, 0.5]
+        """
+        layer_ratio = layer_idx / total_layers
+        
+        if layer_ratio < 0.3:  # Shallow layers (0-30% depth)
+            return 0.5  # Mild spatial pruning, keep more tokens
+        elif layer_ratio < 0.65:  # Middle layers (30-65% depth)
+            return 0.25  # Moderate spatial pruning (paper default)
+        else:  # Deep layers (65-100% depth)
+            return 0.0625  # Aggressive spatial pruning
         
     def compute_redundant_score(self, attention_logits, attention_weights, 
                                  num_vision_tokens, num_text_tokens):
         """
-        Compute redundant pruning scores from self-modality and cross-modality importance.
+        Compute redundant pruning scores (Eq. 3-4).
+        
+        Combines self-modality importance (vision-to-vision attention) and
+        cross-modality importance (text-to-vision attention).
         
         Args:
             attention_logits: Pre-softmax attention [batch, num_heads, L, L]
@@ -41,74 +90,72 @@ class ATPModule(nn.Module):
             num_text_tokens: L_t
             
         Returns:
-            S_redundant: [batch, L_v] - redundant score for each vision token
+            S_redundant: [batch, L_v] - redundant score per vision token
+            S_self: [batch, L_v] - self-modality score
+            S_cross: [batch, L_v] - cross-modality score
         """
-        batch_size = attention_logits.shape[0]
-        
         # Average across attention heads
         attn_logits = attention_logits.mean(dim=1)  # [batch, L, L]
         attn_weights = attention_weights.mean(dim=1)  # [batch, L, L]
         
-        # Extract vision-to-vision attention (self-modality)
-        # Vision tokens are typically at the beginning: [0:L_v]
+        # Self-modality: vision-to-vision attention logits (Eq. 3)
         vision_to_vision_logits = attn_logits[:, :num_vision_tokens, :num_vision_tokens]
+        S_self = vision_to_vision_logits.mean(dim=2)  # [batch, L_v]
         
-        # Self-modality importance score (Eq. 3)
-        # How much attention each vision token receives from other vision tokens
-        S_self = vision_to_vision_logits.mean(dim=1)  # [batch, L_v]
-        
-        # Extract text-to-vision attention (cross-modality)
-        # Text tokens come after vision tokens: [L_v:L_v+L_t]
+        # Cross-modality: text-to-vision attention weights (Eq. 4)
         text_to_vision_weights = attn_weights[:, num_vision_tokens:num_vision_tokens+num_text_tokens, 
                                                :num_vision_tokens]
-        
-        # Cross-modality importance score (Eq. 4)
-        # How much attention each vision token receives from text tokens
         S_cross = text_to_vision_weights.mean(dim=1)  # [batch, L_v]
         
         # Combined redundant score
-        S_redundant = (S_self + S_cross) / 2.0  # [batch, L_v]
+        S_redundant = (S_self + S_cross) / 2.0
         
         return S_redundant, S_self, S_cross
     
-    def compute_spatial_score(self, vision_tokens, sampling_rate=0.5):
+    def compute_spatial_score(self, num_vision_tokens, device):
         """
-        Compute spatial pruning scores via uniform spatial sampling.
+        Compute spatial pruning scores via uniform 2D sampling (Eq. 5).
+        
+        Sampled tokens get score: 1 - R_s * λ_sample
+        Non-sampled tokens get score: 0
         
         Args:
-            vision_tokens: [batch, L_v, D]
-            sampling_rate: R_s - ratio of tokens to sample uniformly
+            num_vision_tokens: L_v (e.g., 576 for 24×24 grid)
+            device: torch device
             
         Returns:
-            S_spatial: [batch, L_v] - spatial score for each token
-            sampled_indices: [batch, num_sampled] - indices of sampled tokens
+            S_spatial: [L_v] - spatial score for each token
         """
-        batch_size, L_v, _ = vision_tokens.shape
+        L_v = num_vision_tokens
         
-        # Assume vision tokens form a square grid (e.g., 24x24=576)
+        # Determine grid dimensions (handles both square and non-square)
         grid_size = int(L_v ** 0.5)
-        assert grid_size * grid_size == L_v, "Vision tokens must form square grid"
+        if grid_size * grid_size != L_v:
+            grid_h = int(L_v ** 0.5)
+            grid_w = (L_v + grid_h - 1) // grid_h
+        else:
+            grid_h = grid_w = grid_size
         
-        # Uniform spatial sampling (every k-th token in 2D grid)
-        stride = int(1.0 / sampling_rate)
+        S_spatial = torch.zeros(L_v, device=device)
+        
+        # Compute stride for uniform sampling: stride = sqrt(1 / R_s)
+        # E.g., R_s=0.25 → stride=2 → samples every 2nd token (12×12 from 24×24)
+        stride = max(1, int(round((1.0 / self.sampling_rate) ** 0.5)))
+        
+        # Collect sampled indices
         sampled_indices = []
-        
-        for i in range(0, grid_size, stride):
-            for j in range(0, grid_size, stride):
-                idx = i * grid_size + j
+        for i in range(0, grid_h, stride):
+            for j in range(0, grid_w, stride):
+                idx = i * grid_w + j
                 if idx < L_v:
                     sampled_indices.append(idx)
         
-        sampled_indices = torch.tensor(sampled_indices, device=vision_tokens.device)
+        if len(sampled_indices) > 0:
+            sampled_indices = torch.tensor(sampled_indices, device=device)
+            score_value = max(0.0, 1.0 - self.sampling_rate * self.lambda_sample)
+            S_spatial[sampled_indices] = score_value
         
-        # Initialize spatial scores (Eq. 5)
-        S_spatial = torch.zeros(batch_size, L_v, device=vision_tokens.device)
-        
-        # Tokens sampled at higher rates get higher scores
-        # Sampled tokens: score = 1 - R_s * lambda_sample
-        S_spatial[:, sampled_indices] = 1.0 - sampling_rate * self.lambda_sample
-        
-        return S_spatial, sampled_indices
+        return S_spatial
     
     def predict_thresholds(self, S_self, S_cross):
         """
@@ -119,18 +166,16 @@ class ATPModule(nn.Module):
             S_cross: [batch, L_v] - cross-modality scores
             
         Returns:
-            theta_r: [batch, 1] - redundant pruning threshold
-            theta_s: [batch, 1] - spatial pruning threshold
+            theta_r: [batch, 1] - redundant pruning threshold ∈ [0,1]
+            theta_s: [batch, 1] - spatial pruning threshold ∈ [0,1]
         """
-        # Aggregate scores by taking mean across tokens
+        # Aggregate scores and project to hidden dim
         S_self_mean = S_self.mean(dim=1, keepdim=True)  # [batch, 1]
         S_cross_mean = S_cross.mean(dim=1, keepdim=True)  # [batch, 1]
-        
-        # Concatenate and project (Eq. 6)
         score_input = torch.cat([S_self_mean, S_cross_mean], dim=1)  # [batch, 2]
         z = self.score_projection(score_input)  # [batch, hidden_dim]
         
-        # Predict thresholds (Eq. 7-8)
+        # Predict thresholds
         theta_r = torch.sigmoid(self.redundant_threshold_head(z))  # [batch, 1]
         theta_s = torch.sigmoid(self.spatial_threshold_head(z))  # [batch, 1]
         
@@ -140,44 +185,22 @@ class ATPModule(nn.Module):
         """
         Generate differentiable soft masks for training (Eq. 9-11).
         
-        Args:
-            S_redundant: [batch, L_v]
-            S_spatial: [batch, L_v]
-            theta_r: [batch, 1]
-            theta_s: [batch, 1]
-            
-        Returns:
-            Mask_final: [batch, L_v] - soft mask in [0, 1]
+        Uses sigmoid with temperature to create smooth gradients.
         """
-        # Soft masks using sigmoid with temperature
-        Mask_r = torch.sigmoid((S_redundant - theta_r) * self.temperature)  # [batch, L_v]
-        Mask_s = torch.sigmoid((S_spatial - theta_s) * self.temperature)  # [batch, L_v]
-        
-        # Element-wise max: keep token if EITHER condition met
-        Mask_final = torch.max(Mask_r, Mask_s)  # [batch, L_v]
-        
+        Mask_r = torch.sigmoid((S_redundant - theta_r) * self.temperature)
+        Mask_s = torch.sigmoid((S_spatial - theta_s) * self.temperature)
+        Mask_final = torch.max(Mask_r, Mask_s)  # Element-wise max
         return Mask_final
     
     def generate_hard_mask(self, S_redundant, S_spatial, theta_r, theta_s):
         """
         Generate hard binary masks for inference.
         
-        Args:
-            S_redundant: [batch, L_v]
-            S_spatial: [batch, L_v]
-            theta_r: [batch, 1]
-            theta_s: [batch, 1]
-            
-        Returns:
-            Mask_final: [batch, L_v] - binary mask (True/False)
+        Uses hard thresholding and logical OR.
         """
-        # Hard thresholding
-        Mask_r = S_redundant > theta_r  # [batch, L_v]
-        Mask_s = S_spatial > theta_s  # [batch, L_v]
-        
-        # Logical OR: keep if either condition met
-        Mask_final = Mask_r | Mask_s  # [batch, L_v]
-        
+        Mask_r = S_redundant > theta_r
+        Mask_s = S_spatial > theta_s
+        Mask_final = Mask_r | Mask_s  # Logical OR
         return Mask_final
     
     def forward(self, vision_tokens, text_tokens, attention_logits, attention_weights,
@@ -188,87 +211,118 @@ class ATPModule(nn.Module):
         Args:
             vision_tokens: [batch, L_v, D] - vision token hidden states
             text_tokens: [batch, L_t, D] - text token hidden states
-            attention_logits: [batch, num_heads, L, L] - pre-softmax attention from previous layer
-            attention_weights: [batch, num_heads, L, L] - post-softmax attention from previous layer
-            position_ids: [batch, L_v] - original position IDs of vision tokens
-            training: bool - training mode or inference mode
+            attention_logits: [batch, num_heads, L, L] - pre-softmax attention
+            attention_weights: [batch, num_heads, L, L] - post-softmax attention
+            position_ids: [batch, L_v] - original 2D position IDs (optional)
+            training: bool - use soft masks (True) or hard pruning (False)
             
         Returns:
-            dict with keys:
-                - 'vision_tokens': vision tokens (all in training, pruned in inference)
-                - 'text_tokens': text tokens (unchanged)
-                - 'vision_mask': soft mask (training only)
-                - 'position_ids': position IDs (inference only)
-                - 'pruning_stats': dict with pruning statistics
+            dict containing:
+                - vision_tokens: [batch, L_v, D] (training) or [batch, L_p_v, D] (inference)
+                - text_tokens: [batch, L_t, D]
+                - vision_mask: [batch, L_v] (training only)
+                - position_ids: [batch, L_p_v] (inference only)
+                - pruning_stats: dict with metrics
         """
         batch_size, L_v, D = vision_tokens.shape
         _, L_t, _ = text_tokens.shape
         
-        # Step 1: Compute redundant pruning scores
+        # Step 1: Compute redundant scores (Eq. 3-4)
         S_redundant, S_self, S_cross = self.compute_redundant_score(
             attention_logits, attention_weights, L_v, L_t
         )
         
-        # Step 2: Compute spatial pruning scores
-        S_spatial, sampled_indices = self.compute_spatial_score(vision_tokens)
+        # Step 2: Compute spatial scores (Eq. 5)
+        S_spatial = self.compute_spatial_score(L_v, vision_tokens.device)
+        S_spatial = S_spatial.unsqueeze(0).expand(batch_size, -1)  # [batch, L_v]
         
-        # Step 3: Predict learnable thresholds
+        # Step 3: Predict learnable thresholds (Eq. 6-8)
         theta_r, theta_s = self.predict_thresholds(S_self, S_cross)
         
-        # Step 4: Generate masks
+        # Step 4: Generate masks and prune
         if training:
-            # Training: soft masks for gradient flow
+            # Soft masks for gradient flow
             Mask_final = self.generate_soft_mask(S_redundant, S_spatial, theta_r, theta_s)
+            
             return {
-                'vision_tokens': vision_tokens,  # Keep ALL tokens
+                'vision_tokens': vision_tokens,  # Keep all tokens physically
                 'text_tokens': text_tokens,
-                'vision_mask': Mask_final,  # Soft mask for attention
+                'vision_mask': Mask_final,  # Soft mask for attention masking
                 'pruning_stats': {
                     'theta_r': theta_r.mean().item(),
                     'theta_s': theta_s.mean().item(),
                     'avg_mask_value': Mask_final.mean().item(),
-                    'estimated_kept_tokens': (Mask_final > 0.5).sum(dim=1).float().mean().item()
+                    'estimated_kept_tokens': (Mask_final > 0.5).sum(dim=1).float().mean().item(),
+                    'S_redundant_mean': S_redundant.mean().item(),
+                    'S_spatial_mean': S_spatial.mean().item(),
                 }
             }
         else:
-            # Inference: hard masks, physically drop tokens
+            # Hard masks - physically drop tokens
             Mask_final = self.generate_hard_mask(S_redundant, S_spatial, theta_r, theta_s)
             
             # Prune vision tokens
-            # Handle batching by iterating (in practice, batch_size=1 for inference)
-            pruned_vision_tokens = []
-            pruned_position_ids = []
-            
-            for b in range(batch_size):
-                mask_b = Mask_final[b]  # [L_v]
-                kept_indices = torch.where(mask_b)[0]
-                
-                # Keep only selected tokens
-                pruned_vision_tokens.append(vision_tokens[b, kept_indices])
+            if batch_size == 1:
+                kept_indices = torch.where(Mask_final[0])[0]
+                pruned_vision_tokens = vision_tokens[0:1, kept_indices]
                 
                 # Preserve original position IDs
                 if position_ids is not None:
-                    pruned_position_ids.append(position_ids[b, kept_indices])
+                    pruned_position_ids = position_ids[0:1, kept_indices]
                 else:
-                    # If not provided, assume sequential [0, 1, 2, ...]
                     original_pos = torch.arange(L_v, device=vision_tokens.device)
-                    pruned_position_ids.append(original_pos[kept_indices])
-            
-            # Stack back (assuming same number kept per batch for simplicity)
-            # In practice, you might need padding for variable lengths
-            pruned_vision_tokens = torch.stack(pruned_vision_tokens, dim=0)
-            pruned_position_ids = torch.stack(pruned_position_ids, dim=0)
+                    pruned_position_ids = original_pos[kept_indices].unsqueeze(0)
+                    
+            else:
+                # Batched inference - pad to handle variable lengths
+                pruned_vision_tokens = []
+                pruned_position_ids = []
+                max_kept = 0
+                
+                for b in range(batch_size):
+                    mask_b = Mask_final[b]
+                    kept_indices = torch.where(mask_b)[0]
+                    max_kept = max(max_kept, len(kept_indices))
+                    
+                    pruned_vision_tokens.append(vision_tokens[b, kept_indices])
+                    
+                    if position_ids is not None:
+                        pruned_position_ids.append(position_ids[b, kept_indices])
+                    else:
+                        original_pos = torch.arange(L_v, device=vision_tokens.device)
+                        pruned_position_ids.append(original_pos[kept_indices])
+                
+                # Pad to max length in batch
+                padded_vision_tokens = []
+                padded_position_ids = []
+                
+                for b in range(batch_size):
+                    tokens = pruned_vision_tokens[b]
+                    pos_ids = pruned_position_ids[b]
+                    
+                    if len(tokens) < max_kept:
+                        pad_len = max_kept - len(tokens)
+                        tokens = torch.cat([tokens, torch.zeros(pad_len, D, device=tokens.device)], dim=0)
+                        pos_ids = torch.cat([pos_ids, torch.zeros(pad_len, dtype=pos_ids.dtype, device=pos_ids.device)], dim=0)
+                    
+                    padded_vision_tokens.append(tokens)
+                    padded_position_ids.append(pos_ids)
+                
+                pruned_vision_tokens = torch.stack(padded_vision_tokens, dim=0)
+                pruned_position_ids = torch.stack(padded_position_ids, dim=0)
             
             return {
-                'vision_tokens': pruned_vision_tokens,  # PRUNED tokens
+                'vision_tokens': pruned_vision_tokens,
                 'text_tokens': text_tokens,
-                'position_ids': pruned_position_ids,  # Original positions preserved
+                'position_ids': pruned_position_ids,
                 'pruning_stats': {
                     'theta_r': theta_r.mean().item(),
                     'theta_s': theta_s.mean().item(),
                     'kept_tokens': pruned_vision_tokens.shape[1],
                     'original_tokens': L_v,
-                    'pruning_ratio': 1.0 - (pruned_vision_tokens.shape[1] / L_v)
+                    'pruning_ratio': 1.0 - (pruned_vision_tokens.shape[1] / L_v),
+                    'S_redundant_mean': S_redundant.mean().item(),
+                    'S_spatial_mean': S_spatial.mean().item(),
                 }
             }
 
