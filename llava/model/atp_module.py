@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 class ATPModule(nn.Module):
     """
-    Adaptive Token Pruning Module from ATP-LLaVA paper.
+    Adaptive Token Pruning Module
     
     Inserts between LLM decoder layers to adaptively prune vision tokens
     based on redundancy and spatial importance scores.
