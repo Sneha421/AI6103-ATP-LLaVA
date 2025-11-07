@@ -23,7 +23,7 @@ from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
-def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
+def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, use_atp=True, atp_config=None, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
 
     if device != "cuda":
@@ -44,6 +44,21 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
+    
+    # ATP Configuration (enabled by default)
+    if atp_config is None:
+        atp_config = {
+            'use_atp': use_atp,
+            'atp_lambda_atp': 0.05,      # From paper
+            'atp_lambda_target': 0.2,    # From paper  
+            'atp_target_tokens': 144,    # From paper
+            'atp_initial_tokens': 576,   # ViT-L/14: 24x24 patches
+        }
+    
+    # Add ATP config to kwargs for model initialization
+    kwargs.update(atp_config)
+    
+    print(f"ATP Configuration: {atp_config}")
 
     if 'llava' in model_name.lower():
         # Load LLaVA model
@@ -52,6 +67,11 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if 'lora' in model_name.lower() and model_base is not None:
             from llava.model.language_model.llava_llama import LlavaConfig
             lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
+            
+            # Add ATP configuration to LoRA config
+            for key, value in atp_config.items():
+                setattr(lora_cfg_pretrained, key, value)
+                
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             print('Loading LLaVA from base model...')
             model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
@@ -96,6 +116,11 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
+                
+                # Add ATP configuration to pretrained config
+                for key, value in atp_config.items():
+                    setattr(cfg_pretrained, key, value)
+                
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
 
             mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
@@ -114,8 +139,15 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 )
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+                
+                # Load config and add ATP parameters
+                config = AutoConfig.from_pretrained(model_path)
+                for key, value in atp_config.items():
+                    setattr(config, key, value)
+                
                 model = LlavaLlamaForCausalLM.from_pretrained(
                     model_path,
+                    config=config,
                     low_cpu_mem_usage=True,
                     **kwargs
                 )

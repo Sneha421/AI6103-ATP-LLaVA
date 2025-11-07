@@ -25,24 +25,38 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
+from .llava_llama_atp import LlamaModelWithATP, LlamaForCausalLMWithATP
 
 
 class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
+    
+    def __init__(self, **kwargs):
+        # ATP configuration with default enabled
+        self.use_atp = kwargs.pop("use_atp", True)  # ATP enabled by default
+        self.atp_lambda_atp = kwargs.pop("atp_lambda_atp", 0.05)
+        self.atp_lambda_target = kwargs.pop("atp_lambda_target", 0.2) 
+        self.atp_target_tokens = kwargs.pop("atp_target_tokens", 144)
+        self.atp_initial_tokens = kwargs.pop("atp_initial_tokens", 576)
+        
+        super().__init__(**kwargs)
 
 
-class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
+class LlavaLlamaModel(LlavaMetaModel, LlamaModelWithATP):
     config_class = LlavaConfig
 
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
+        
+        # Initialize with default vision token count (ViT-L/14: 24x24 = 576)
+        self.set_vision_token_count(getattr(config, 'atp_initial_tokens', 576))
 
 
-class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
+class LlavaLlamaForCausalLM(LlamaForCausalLMWithATP, LlavaMetaForCausalLM):
     config_class = LlavaConfig
 
     def __init__(self, config):
-        super(LlamaForCausalLM, self).__init__(config)
+        super(LlamaForCausalLMWithATP, self).__init__(config)
         self.model = LlavaLlamaModel(config)
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
@@ -87,6 +101,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 images,
                 image_sizes
             )
+            
+            # Set vision token count for ATP when processing multimodal inputs
+            if images is not None and hasattr(self.model, 'set_vision_token_count'):
+                # Calculate vision token count based on image processing
+                if hasattr(self.get_vision_tower(), 'num_patches'):
+                    vision_token_count = self.get_vision_tower().num_patches
+                else:
+                    # Default calculation for ViT-L/14 (336px / 14px = 24, 24x24 = 576)
+                    vision_token_count = getattr(self.config, 'atp_initial_tokens', 576)
+                
+                self.model.set_vision_token_count(vision_token_count)
 
         return super().forward(
             input_ids=input_ids,
@@ -131,6 +156,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 images,
                 image_sizes=image_sizes
             )
+            
+            # Set vision token count for ATP during generation
+            if hasattr(self.model, 'set_vision_token_count'):
+                if hasattr(self.get_vision_tower(), 'num_patches'):
+                    vision_token_count = self.get_vision_tower().num_patches
+                else:
+                    vision_token_count = getattr(self.config, 'atp_initial_tokens', 576)
+                self.model.set_vision_token_count(vision_token_count)
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 

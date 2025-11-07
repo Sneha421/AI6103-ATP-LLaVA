@@ -110,6 +110,13 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    
+    # ATP training arguments (enabled by default)
+    use_atp: bool = field(default=True, metadata={"help": "Enable ATP (Adaptive Token Pruning)"})
+    atp_lambda_atp: float = field(default=0.05, metadata={"help": "ATP penalty weight (from paper)"})
+    atp_lambda_target: float = field(default=0.2, metadata={"help": "Target constraint weight (from paper)"})
+    atp_target_tokens: int = field(default=144, metadata={"help": "Target number of tokens to keep (from paper)"})
+    atp_initial_tokens: int = field(default=576, metadata={"help": "Initial number of vision tokens (ViT-L/14: 24x24=576)"})
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):

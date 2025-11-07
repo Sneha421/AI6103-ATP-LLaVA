@@ -45,6 +45,34 @@ class LlavaMetaModel:
         if type(vision_tower) is list:
             vision_tower = vision_tower[0]
         return vision_tower
+    
+    def get_vision_token_count(self):
+        """
+        Calculate the number of vision tokens for ATP module.
+        
+        Returns:
+            int: Number of vision tokens (e.g., 576 for ViT-L/14 24x24 patches)
+        """
+        vision_tower = self.get_vision_tower()
+        if vision_tower is None:
+            return getattr(self.config, 'atp_initial_tokens', 576)  # Default fallback
+        
+        # Try to get patch count from vision tower
+        if hasattr(vision_tower, 'num_patches'):
+            return vision_tower.num_patches
+        elif hasattr(vision_tower, 'num_patches_per_side'):
+            # For square patch grids
+            patches_per_side = vision_tower.num_patches_per_side
+            return patches_per_side * patches_per_side
+        elif hasattr(vision_tower.config, 'image_size') and hasattr(vision_tower.config, 'patch_size'):
+            # Calculate from image and patch sizes
+            image_size = vision_tower.config.image_size
+            patch_size = vision_tower.config.patch_size
+            patches_per_side = image_size // patch_size
+            return patches_per_side * patches_per_side
+        else:
+            # Fallback to config default
+            return getattr(self.config, 'atp_initial_tokens', 576)
 
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower

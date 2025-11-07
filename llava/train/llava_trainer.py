@@ -131,6 +131,73 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # Initialize ATP loss function if enabled
+        if getattr(self.args, 'use_atp', False):
+            from llava.model.atp_module import ATPLoss
+            self.atp_loss_fn = ATPLoss(
+                lambda_atp=getattr(self.args, 'atp_lambda_atp', 0.05),
+                lambda_target=getattr(self.args, 'atp_lambda_target', 0.2),
+                target_tokens=getattr(self.args, 'atp_target_tokens', 144),
+                initial_vision_tokens=getattr(self.args, 'atp_initial_tokens', 576),
+            )
+            print(f"ATP Loss initialized: λ_atp={self.atp_loss_fn.lambda_atp}, "
+                  f"λ_target={self.atp_loss_fn.lambda_target}, "
+                  f"target_tokens={self.atp_loss_fn.target_tokens}")
+        else:
+            self.atp_loss_fn = None
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        Compute loss including ATP penalty if enabled.
+        """
+        # Standard forward pass
+        outputs = model(**inputs)
+        
+        # Get standard language modeling loss
+        loss = outputs.loss if hasattr(outputs, 'loss') else outputs.get('loss', 0)
+
+        # Add ATP loss if ATP is enabled and masks are available
+        if (self.atp_loss_fn is not None and 
+            hasattr(model, 'model') and 
+            hasattr(model.model, 'atp_masks') and 
+            model.model.atp_masks):
+            
+            try:
+                atp_loss_dict = self.atp_loss_fn(
+                    model.model.atp_masks, 
+                    model.model.atp_insertion_points
+                )
+                
+                # Add ATP loss to total loss
+                loss = loss + atp_loss_dict['total_atp_loss']
+                
+                # Log ATP statistics periodically
+                if self.state.global_step % 100 == 0 and self.state.global_step > 0:
+                    print(f"\n=== Step {self.state.global_step} ATP Stats ===")
+                    print(f"Standard Loss: {outputs.loss:.4f}")
+                    print(f"ATP Total Loss: {atp_loss_dict['total_atp_loss']:.4f}")
+                    print(f"ATP Penalty: {atp_loss_dict['atp_penalty']:.4f}")
+                    print(f"Target Loss: {atp_loss_dict['target_loss']:.4f}")
+                    
+                    # Log pruning statistics from ATP modules
+                    if hasattr(model.model, 'atp_stats') and model.model.atp_stats:
+                        for i, stats in enumerate(model.model.atp_stats):
+                            layer_idx = model.model.atp_insertion_points[i]
+                            print(f"ATP Layer {layer_idx}:")
+                            print(f"  Kept tokens: {stats.get('estimated_kept_tokens', 'N/A'):.1f}")
+                            print(f"  Theta_r: {stats.get('theta_r', 'N/A'):.3f}")
+                            print(f"  Theta_s: {stats.get('theta_s', 'N/A'):.3f}")
+                            print(f"  Mask value: {stats.get('avg_mask_value', 'N/A'):.3f}")
+            
+            except Exception as e:
+                print(f"Warning: ATP loss computation failed: {e}")
+                # Continue with standard loss if ATP fails
+
+        return (loss, outputs) if return_outputs else loss
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
