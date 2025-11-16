@@ -26,6 +26,380 @@ from transformers.generation.utils import GenerateOutput
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
+# for custom layer
+from typing import Dict, Any
+from packaging import version
+from transformers import __version__ as __transformer_version__
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+
+class MyInterLayer(nn.Module):
+    """
+    This is the custom inter layer.
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        num_vision_tokens: int,
+        lambda_sample: float = 3.0,
+        temperature: float = 100.0
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_vision_tokens = num_vision_tokens
+
+        # sampling scaling corfficient
+        self.lambda_sample = lambda_sample
+
+        # temperature
+        self.temperature = temperature
+        # ... make it a trainable hyperparameter
+        self.register_buffer('T', torch.tensor(temperature))
+
+        # MLP to get theta scalars with linear transformation
+        self.shared_fc = nn.Sequential(
+            nn.Linear(num_vision_tokens * 2, hidden_size // 16),
+            nn.ReLU()
+        )
+
+        # Two independent predition heads
+        self.head_redundant = nn.Sequential(
+            nn.Linear(hidden_size // 16, 1),
+            nn.Sigmoid()
+        )
+        self.head_spatial = nn.Sequential(
+            nn.Linear(hidden_size // 16, 1),
+            nn.Sigmoid()
+        )
+
+        # initialize sampling grid (should be 24x24)
+        self.grid_size = int(num_vision_tokens ** 0.5)
+
+        # Initialize instrumantation
+        self.instrument = None
+
+    def compute_scores(
+        self,
+        attention_weights: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute scores for formula (3), (4) and (5).
+        """
+        batch_size = attention_weights.shape[0]
+        device = attention_weights.device
+
+        # 1. extract attention maps
+        # vision token self attention
+        # [B, H, L_v, L_v]
+        self_attn_map = attention_weights[:, :, :self.num_vision_tokens, :self.num_vision_tokens]
+        # text to vision attention
+        # [B, H, L_t, L_v]
+        text_vision_map = attention_weights[:, :, self.num_vision_tokens:, :self.num_vision_tokens]
+
+        # 2. compute S_self (3)
+        # for each vision token, compute the average attention it
+        #   receives from the other vision tokens
+        # [B, H, L_v, L_v] -> mean over heads and keys -> [B, L_v]
+        S_self = self_attn_map.mean(dim=(1, 3))
+
+        # 3. compute S_cross (4)
+        # For each vision token, compute the average attention it
+        #   receives from the other text tokens
+        # [B, H, L_t, L_v] -> mean over heads and queries(text) -> [B, L_v]
+        S_cross = text_vision_map.mean(dim=(1, 2))
+
+        # 4. combine to compute S_redundant
+        # S_redundant = (S_self + S_cross) / 2
+        S_redundant = (S_self + S_cross) / 2.0
+
+        # 5. spatial sampling
+        stride = 2
+        sampled_positions = self.grid_size // stride
+        num_sampled = sampled_positions ** 2  # total number of tokens
+        # sample rate: R^s = num_sampled / L_v
+        R_s = num_sampled / self.num_vision_tokens
+
+        # 6. spatial score (to mark which token got kept)
+        # [batch, L_v]
+        sample_mask = torch.zeros(batch_size, self.num_vision_tokens, device=device)
+
+        # sampling in the grid
+        for i in range(0, self.grid_size, stride):
+            for j in range(0, self.grid_size, stride):
+                idx = i * self.grid_size + j
+                sample_mask[:, idx] = 1.0
+
+        # 7. compute the spatial score base on the sampling (5)
+        # S_spatial = 1 - R^s * λ_sample
+        S_spatial = torch.where(
+            sample_mask.bool(),
+            1 - R_s * self.lambda_sample,
+            torch.tensor(0.0, device=device)
+        )
+
+        return S_redundant, S_spatial, S_self, S_cross
+
+    def predict_thresholds(
+        self,
+        S_self: torch.Tensor,
+        S_cross: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predicting thresholds
+
+        params:
+            S_self: [B, L_v]
+            S_cross: [B, L_v]
+
+        return:
+            theta_r: [B, 1]
+            theta_s: [B, 1]
+        """
+        # z = Linear(concat(S_self, S_cross)) (6)
+        score_features = torch.cat([S_self, S_cross], dim=-1)  # [B, 2*L_v]
+
+        # shared features
+        # TODO: score_features can have dimension mismatch
+        shared_features = self.shared_fc(score_features)  # [B, 2*L_v] -> [B, 256]
+
+        # two-head predictors (7) (8)
+        theta_r = self.head_redundant(shared_features)  # [B, 256] -> [B, 1]
+        theta_s = self.head_spatial(shared_features)    # [B, 256] -> [B, 1]
+
+        return theta_r, theta_s
+
+    def generate_masks(
+        self,
+        S_redundant: torch.Tensor,
+        S_spatial: torch.Tensor,
+        theta_r: torch.Tensor,
+        theta_s: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Generate masks.
+
+        params:
+            S_redundant: [B, L_v]
+            S_spatial: [B, L_v]
+            theta_r: [B, 1]
+            theta_s: [B, 1]
+
+        return:
+            mask_r: [B, L_v]
+            mask_s: [B, L_v]
+            mask: [B, L_v]
+        """
+        # Mask_r = σ((S_redundant - θ_r) * T) (9)
+        # Mask_s = σ((S_spatial - θ_s) * T) (10)
+        # where T is the temperature
+
+        # matching the dimensions [B, 1] -> [B, L_v]
+        theta_r = theta_r.expand_as(S_redundant)
+        theta_s = theta_s.expand_as(S_spatial)
+
+        mask_r = torch.sigmoid((S_redundant - theta_r) * self.T)
+        mask_s = torch.sigmoid((S_spatial - theta_s) * self.T)
+
+        # Mask = max(Mask^r, Mask^s) (11)
+        # [B, L_v]
+        mask = torch.max(mask_r, mask_s)
+
+        return mask_r, mask_s, mask
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_weights: Optional[torch.Tensor] = None,
+        is_training: bool = True
+    ) -> Tuple[torch.Tensor, Optional[torch.LongTensor], Dict[str, Any]]:
+        """
+        Propagate, calculating scores
+
+        params:
+            x: [batch, seq_len, hidden_size]
+            attention_weights: [batch, num_heads, seq_len, seq_len] OR None
+        return:
+            [batch, seq_len, hidden_size]
+        """
+        # batch_size, seq_len, _ = x.shape
+
+        # ==== Vision and text token extraction ====
+        # First num_vision_tokens are vision tokens
+        vision_tokens = x[:, :self.num_vision_tokens, :]  # [B, 576, hidden_size]
+        text_tokens = x[:, self.num_vision_tokens:, :]    # [B, seq_len-576, hidden_size]
+
+        # ==== Process attention weights ====
+        # attention_weights: [B, H, seq_len, seq_len]
+        if attention_weights is not None:
+            # 3.3.1: compute redundant and spatial score
+            (
+                redundant_score,
+                spatial_score,
+                self_modal_score,
+                cross_modal_score
+            ) = self.compute_scores(attention_weights)
+
+            # 3.3.2 part I: token pruning
+            theta_r, theta_s = self.predict_thresholds(
+                self_modal_score, cross_modal_score
+            )
+
+            # 3.3.2 part II: generate masks
+            mask, mask_r, mask_s = self.generate_masks(
+                redundant_score, spatial_score, theta_r, theta_s
+            )
+
+            # Apply masks
+            if is_training:
+                # the mask are passed to next layer's attention
+                pruned_vision_tokens = vision_tokens
+            else:
+                # hard prune: only keep tokens with mask>0.5
+                kept_indices = (mask > 0.5).nonzero(as_tuple=True)[1]
+                pruned_vision_tokens = vision_tokens[:, kept_indices]
+            
+            instrument = {
+                'mask': mask,
+                'mask_r': mask_r,
+                'mask_s': mask_s,
+                'theta_r': theta_r.mean().item(),
+                'theta_s': theta_s.mean().item(),
+                'num_vision_token': pruned_vision_tokens.shape[1],
+                'kept_token_ratio': (mask > 0.5).float().mean().item()
+            }
+
+            x_new = torch.cat([pruned_vision_tokens, text_tokens], dim=1)
+        else:
+            # empty instrument
+            instrument = {}
+            # direct passthrough
+            x_new = x
+
+        # save instrumentation
+        self.instrument = instrument
+
+        return x_new, instrument
+
+class MyDecoderLayer(LlamaDecoderLayer):
+    """
+    Llama layer + optional custom inter layer.
+
+    * ouput_attention is required, remember to
+      modify llava/train/train.py, at model.forward():
+            outputs = model(
+                input_ids=input_ids,
+                images=images,
+                labels=labels,
+                output_attentions=True,  # -> fetch attention weights
+            )
+    """
+
+    # minimal transformer version
+    _MINIMAL_VERSION = "4.40.0"
+
+    def __init__(
+        self,
+        config: LlamaConfig,
+        layer_idx: int
+    ):
+        super().__init__(config, layer_idx)
+        self.layer_idx = layer_idx
+        self.num_vision_tokens = 576
+
+        # NOTE: version guard is required, since the
+        #       implementation of forward() have changed.
+        if version.parse(__transformer_version__) < \
+            version.parse(self._MINIMAL_VERSION):
+            raise ValueError(
+                f"MyDecoderLayer requires transformers >= {self._MINIMAL_VERSION}, "
+                f"but current version is {__transformer_version__}."
+            )
+
+        # ATP context passthrough
+        self.prev_atp_mask = None
+        self.prev_num_vision_token = self.num_vision_tokens
+
+        # Instantiate custom layers
+        if layer_idx in [4, 14, 24]:
+            self.inter_layer = MyInterLayer(
+                config.hidden_size,
+                self.num_vision_tokens
+            )
+
+    # Exact copy of LlamaDecoderLayer.forward()
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        cache_position=None,
+        **kwargs
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # apply ATP mask
+        if self.training and self.prev_atp_mask is not None:
+            if attention_mask is None:
+                attention_mask = torch.zeros(
+                    1, 1, 1, hidden_states.shape[1],
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype
+                )
+            bias = (1 - self.prev_atp_mask).unsqueeze(1).unsqueeze(2) * \
+                torch.finfo(hidden_states.dtype).min
+            attention_mask = attention_mask + bias
+
+        # continue with transformer attention
+        hidden_states, attn_weights = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        # Insert custom module
+        if self.layer_idx in [4, 14, 24]:
+            hidden_states, instrument = self.inter_layer(
+                hidden_states,
+                attn_weights=attn_weights,
+                is_training=self.training
+            )
+
+            # update 
+            next_idx = self.layer_idx + 1
+            if next_idx < len(self.layers):
+                next_layer = self.layers[next_idx]
+                next_layer.prev_num_vision_token = instrument['num_vision_token']
+
+            # while training, pass the mask to next layer
+            if self.training:
+                mask = instrument['mask']
+                if next_idx < len(self.layers):
+                    next_layer = self.layers[next_idx]
+                    next_layer.prev_atp_mask = mask
+
+            # clear current mask after use
+            self.prev_atp_mask = None
+        else:
+            # simply pass through
+            next_idx = self.layer_idx + 1
+            if next_idx < len(self.layers):
+                next_layer = self.layers[next_idx]
+                next_layer.prev_num_vision_token = self.prev_num_vision_token
+
+        return hidden_states
+
 
 class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
@@ -36,6 +410,11 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
 
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
+
+        # replace all layers with Llama custom layers
+        self.layers = nn.ModuleList(
+            [MyDecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+        )
 
 
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
