@@ -32,20 +32,17 @@ from packaging import version
 from transformers import __version__ as __transformer_version__
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
-class MyInterLayer(nn.Module):
+class ATPModule(nn.Module):
     """
     This is the custom inter layer.
     """
     def __init__(
         self,
-        hidden_size: int,
         num_vision_tokens: int,
         lambda_sample: float = 3.0,
         temperature: float = 100.0
     ):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_vision_tokens = num_vision_tokens
 
         # sampling scaling corfficient
         self.lambda_sample = lambda_sample
@@ -57,17 +54,17 @@ class MyInterLayer(nn.Module):
 
         # MLP to get theta scalars with linear transformation
         self.shared_fc = nn.Sequential(
-            nn.Linear(num_vision_tokens * 2, hidden_size // 16),
+            nn.Linear(num_vision_tokens * 2, 256),
             nn.ReLU()
         )
 
         # Two independent predition heads
         self.head_redundant = nn.Sequential(
-            nn.Linear(hidden_size // 16, 1),
+            nn.Linear(256, 1),
             nn.Sigmoid()
         )
         self.head_spatial = nn.Sequential(
-            nn.Linear(hidden_size // 16, 1),
+            nn.Linear(256, 1),
             nn.Sigmoid()
         )
 
@@ -75,7 +72,7 @@ class MyInterLayer(nn.Module):
         self.grid_size = int(num_vision_tokens ** 0.5)
 
         # Initialize instrumantation
-        self.instrument = None
+        self.instrument = {}
 
     def compute_scores(
         self,
@@ -207,8 +204,10 @@ class MyInterLayer(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.LongTensor] = None,
         attention_weights: Optional[torch.Tensor] = None,
+        num_vision_tokens = 0,
         is_training: bool = True
     ) -> Tuple[torch.Tensor, Optional[torch.LongTensor], Dict[str, Any]]:
         """
@@ -224,8 +223,13 @@ class MyInterLayer(nn.Module):
 
         # ==== Vision and text token extraction ====
         # First num_vision_tokens are vision tokens
-        vision_tokens = x[:, :self.num_vision_tokens, :]  # [B, 576, hidden_size]
-        text_tokens = x[:, self.num_vision_tokens:, :]    # [B, seq_len-576, hidden_size]
+        vision_tokens = hidden_states[:, :num_vision_tokens, :]  # [B, L_v, hidden_size]
+        text_tokens = hidden_states[:, num_vision_tokens:, :]    # [B, seq_len-L_v, hidden_size]
+
+        # Position IDs
+        vision_position_ids = position_ids[:, :num_vision_tokens]
+        text_position_ids = position_ids[:, num_vision_tokens:]
+
 
         # ==== Process attention weights ====
         # attention_weights: [B, H, seq_len, seq_len]
@@ -256,7 +260,13 @@ class MyInterLayer(nn.Module):
                 # hard prune: only keep tokens with mask>0.5
                 kept_indices = (mask > 0.5).nonzero(as_tuple=True)[1]
                 pruned_vision_tokens = vision_tokens[:, kept_indices]
-            
+
+                # preserve original position IDs
+                if position_ids is not None:
+                    pruned_position_ids = vision_position_ids[:, kept_indices]
+                    position_ids = torch.cat([pruned_position_ids, text_position_ids], dim=1)
+
+            # XXX: maybe a instrumentation class is better
             instrument = {
                 'mask': mask,
                 'mask_r': mask_r,
@@ -267,43 +277,45 @@ class MyInterLayer(nn.Module):
                 'kept_token_ratio': (mask > 0.5).float().mean().item()
             }
 
-            x_new = torch.cat([pruned_vision_tokens, text_tokens], dim=1)
+            hidden_states = torch.cat([pruned_vision_tokens, text_tokens], dim=1)
         else:
             # empty instrument
             instrument = {}
-            # direct passthrough
-            x_new = x
 
         # save instrumentation
         self.instrument = instrument
 
-        return x_new, instrument
+        return hidden_states, position_ids, instrument
+
+class PruningContext():
+    """
+    Shared context for all decoder layers
+    """
+    def __init__(self, num_layers):
+        # NOTE: extra slot to prevent boundary check
+        self.num_vision_token = [[] for _ in range(num_layers+1)]
+        self.mask = None
 
 class MyDecoderLayer(LlamaDecoderLayer):
     """
     Llama layer + optional custom inter layer.
-
-    * ouput_attention is required, remember to
-      modify llava/train/train.py, at model.forward():
-            outputs = model(
-                input_ids=input_ids,
-                images=images,
-                labels=labels,
-                output_attentions=True,  # -> fetch attention weights
-            )
     """
 
     # minimal transformer version
     _MINIMAL_VERSION = "4.40.0"
 
+    # initial vision tokens
+    _MAX_VISION_TOKENS = 576
+
     def __init__(
         self,
         config: LlamaConfig,
-        layer_idx: int
+        layer_idx: int,
+        shared_context: PruningContext
     ):
         super().__init__(config, layer_idx)
         self.layer_idx = layer_idx
-        self.num_vision_tokens = 576
+        self.context: PruningContext = shared_context   # shared across layers
 
         # NOTE: version guard is required, since the
         #       implementation of forward() have changed.
@@ -314,16 +326,26 @@ class MyDecoderLayer(LlamaDecoderLayer):
                 f"but current version is {__transformer_version__}."
             )
 
-        # ATP context passthrough
-        self.prev_atp_mask = None
-        self.prev_num_vision_token = self.num_vision_tokens
-
-        # Instantiate custom layers
+        # Instantiate pruners
+        self.pruner = None
         if layer_idx in [4, 14, 24]:
-            self.inter_layer = MyInterLayer(
-                config.hidden_size,
-                self.num_vision_tokens
-            )
+            self.pruner = ATPModule(self._MAX_VISION_TOKENS)
+
+    # Apply the pruning mask before attention
+    def apply_pruning_mask(self, attention_mask, hidden_states):
+        if self.training and self.context.mask is not None:
+            if attention_mask is None:
+                attention_mask = torch.zeros(
+                    1, 1, 1, hidden_states.shape[1],
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype
+                )
+            bias = (1 - self.prev_atp_mask).unsqueeze(1).unsqueeze(2) * \
+                torch.finfo(hidden_states.dtype).min
+            attention_mask = attention_mask + bias
+
+        self.context.mask = None
+        return attention_mask
 
     # Exact copy of LlamaDecoderLayer.forward()
     def forward(
@@ -339,17 +361,10 @@ class MyDecoderLayer(LlamaDecoderLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        # apply ATP mask
-        if self.training and self.prev_atp_mask is not None:
-            if attention_mask is None:
-                attention_mask = torch.zeros(
-                    1, 1, 1, hidden_states.shape[1],
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype
-                )
-            bias = (1 - self.prev_atp_mask).unsqueeze(1).unsqueeze(2) * \
-                torch.finfo(hidden_states.dtype).min
-            attention_mask = attention_mask + bias
+        # apply pruning mask
+        attention_mask = self.apply_pruning_mask(
+            attention_mask, hidden_states
+        )
 
         # continue with transformer attention
         hidden_states, attn_weights = self.self_attn(
@@ -368,35 +383,33 @@ class MyDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        # Insert custom module
-        if self.layer_idx in [4, 14, 24]:
-            hidden_states, instrument = self.inter_layer(
+        # get number of vision tokens
+        num_vision_tokens = self.context.num_vision_token[self.layer_idx]
+
+        # insert custom module
+        if self.pruner is not None:
+            (
                 hidden_states,
-                attn_weights=attn_weights,
+                position_ids,
+                instrument
+            ) = self.pruner(
+                hidden_states=hidden_states,
+                attention_weights=attn_weights,
+                num_vision_tokens=num_vision_tokens,
                 is_training=self.training
             )
 
-            # update 
-            next_idx = self.layer_idx + 1
-            if next_idx < len(self.layers):
-                next_layer = self.layers[next_idx]
-                next_layer.prev_num_vision_token = instrument['num_vision_token']
+            # update next layer's number of vision tokens
+            self.context.num_vision_token[self.layer_idx + 1] = (
+                instrument['num_vision_token']
+            )
 
             # while training, pass the mask to next layer
             if self.training:
-                mask = instrument['mask']
-                if next_idx < len(self.layers):
-                    next_layer = self.layers[next_idx]
-                    next_layer.prev_atp_mask = mask
-
-            # clear current mask after use
-            self.prev_atp_mask = None
+                self.context.mask = instrument['mask']
         else:
-            # simply pass through
-            next_idx = self.layer_idx + 1
-            if next_idx < len(self.layers):
-                next_layer = self.layers[next_idx]
-                next_layer.prev_num_vision_token = self.prev_num_vision_token
+            # the vision token never pruned
+            self.context.num_vision_token[self.layer_idx + 1] = num_vision_tokens
 
         return hidden_states
 
@@ -411,9 +424,13 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
 
+        # initializing the shared context
+        self.pruning_context = PruningContext(config.num_hidden_layers)
+
         # replace all layers with Llama custom layers
         self.layers = nn.ModuleList(
-            [MyDecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+            [MyDecoderLayer(config, i, self.pruning_context)
+             for i in range(config.num_hidden_layers)]
         )
 
 
