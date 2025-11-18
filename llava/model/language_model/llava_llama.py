@@ -76,7 +76,8 @@ class ATPModule(nn.Module):
 
     def compute_scores(
         self,
-        attention_weights: torch.Tensor
+        attention_weights: torch.Tensor,
+        num_vision_tokens
     ) -> torch.Tensor:
         """
         Compute scores for formula (3), (4) and (5).
@@ -87,16 +88,16 @@ class ATPModule(nn.Module):
         # 1. extract attention maps
         # vision token self attention
         # [B, H, L_v, L_v]
-        self_attn_map = attention_weights[:, :, :self.num_vision_tokens, :self.num_vision_tokens]
+        self_attn_map = attention_weights[:, :, :num_vision_tokens, :num_vision_tokens]
         # text to vision attention
         # [B, H, L_t, L_v]
-        text_vision_map = attention_weights[:, :, self.num_vision_tokens:, :self.num_vision_tokens]
+        text_vision_map = attention_weights[:, :, num_vision_tokens:, :num_vision_tokens]
 
         # 2. compute S_self (3)
         # for each vision token, compute the average attention it
         #   receives from the other vision tokens
         # [B, H, L_v, L_v] -> mean over heads and keys -> [B, L_v]
-        S_self = self_attn_map.mean(dim=(1, 3))
+        S_self = self_attn_map.mean(dim=(1, 2))
 
         # 3. compute S_cross (4)
         # For each vision token, compute the average attention it
@@ -113,11 +114,11 @@ class ATPModule(nn.Module):
         sampled_positions = self.grid_size // stride
         num_sampled = sampled_positions ** 2  # total number of tokens
         # sample rate: R^s = num_sampled / L_v
-        R_s = num_sampled / self.num_vision_tokens
+        R_s = num_sampled / num_vision_tokens
 
         # 6. spatial score (to mark which token got kept)
         # [batch, L_v]
-        sample_mask = torch.zeros(batch_size, self.num_vision_tokens, device=device)
+        sample_mask = torch.zeros(batch_size, num_vision_tokens, device=device)
 
         # sampling in the grid
         for i in range(0, self.grid_size, stride):
@@ -240,7 +241,9 @@ class ATPModule(nn.Module):
                 spatial_score,
                 self_modal_score,
                 cross_modal_score
-            ) = self.compute_scores(attention_weights)
+            ) = self.compute_scores(
+                attention_weights, num_vision_tokens
+            )
 
             # 3.3.2 part I: token pruning
             theta_r, theta_s = self.predict_thresholds(
