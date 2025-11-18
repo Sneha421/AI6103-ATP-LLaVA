@@ -97,7 +97,7 @@ class ATPModule(nn.Module):
         # for each vision token, compute the average attention it
         #   receives from the other vision tokens
         # [B, H, L_v, L_v] -> mean over heads and keys -> [B, L_v]
-        S_self = self_attn_map.mean(dim=(1, 2))
+        S_self = self_attn_map.mean(dim=(1, 3))
 
         # 3. compute S_cross (4)
         # For each vision token, compute the average attention it
@@ -131,7 +131,7 @@ class ATPModule(nn.Module):
         S_spatial = torch.where(
             sample_mask.bool(),
             1 - R_s * self.lambda_sample,
-            torch.tensor(0.0, device=device)
+            torch.tensor(-100.0, device=device)
         )
 
         return S_redundant, S_spatial, S_self, S_cross
@@ -170,7 +170,8 @@ class ATPModule(nn.Module):
         S_redundant: torch.Tensor,
         S_spatial: torch.Tensor,
         theta_r: torch.Tensor,
-        theta_s: torch.Tensor
+        theta_s: torch.Tensor,
+        is_training: bool
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generate masks.
@@ -194,12 +195,23 @@ class ATPModule(nn.Module):
         theta_r = theta_r.expand_as(S_redundant)
         theta_s = theta_s.expand_as(S_spatial)
 
-        mask_r = torch.sigmoid((S_redundant - theta_r) * self.T)
-        mask_s = torch.sigmoid((S_spatial - theta_s) * self.T)
+        if is_training:
+            # during training soft masks
+            mask_r = torch.sigmoid((S_redundant - theta_r) * self.T)
+            mask_s = torch.sigmoid((S_spatial - theta_s) * self.T)
 
-        # Mask = max(Mask^r, Mask^s) (11)
-        # [B, L_v]
-        mask = torch.max(mask_r, mask_s)
+            # Mask = max(Mask^r, Mask^s) (11)
+            # [B, L_v]
+            mask = torch.max(mask_r, mask_s)
+        else:
+            # during inference, we use hard masks
+            mask_r = (S_redundant > theta_r)
+            mask_s = (S_spatial > theta_s)
+            mask = torch.logical_or(mask_r, mask_s)
+
+        # TODO: according to paper, the soft mask should later
+        #       multplied with attention weights. But I don't
+        #       know how yet
 
         return mask_r, mask_s, mask
 
@@ -220,7 +232,7 @@ class ATPModule(nn.Module):
         return:
             [batch, seq_len, hidden_size]
         """
-        # batch_size, seq_len, _ = x.shape
+        batch_size, seq_len, _ = hidden_states.shape
 
         # ==== Vision and text token extraction ====
         # First num_vision_tokens are vision tokens
@@ -228,6 +240,8 @@ class ATPModule(nn.Module):
         text_tokens = hidden_states[:, num_vision_tokens:, :]    # [B, seq_len-L_v, hidden_size]
 
         # Position IDs
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0)
         vision_position_ids = position_ids[:, :num_vision_tokens]
         text_position_ids = position_ids[:, num_vision_tokens:]
 
@@ -259,15 +273,21 @@ class ATPModule(nn.Module):
             if is_training:
                 # the mask are passed to next layer's attention
                 pruned_vision_tokens = vision_tokens
+
+                # get prune ratio
+                ratio = mask.float().mean().item()  # For soft mask
             else:
-                # hard prune: only keep tokens with mask>0.5
-                kept_indices = (mask > 0.5).nonzero(as_tuple=True)[1]
+                # hard prune
+                kept_indices = mask.nonzero(as_tuple=True)[1]
                 pruned_vision_tokens = vision_tokens[:, kept_indices]
 
                 # preserve original position IDs
                 if position_ids is not None:
                     pruned_position_ids = vision_position_ids[:, kept_indices]
                     position_ids = torch.cat([pruned_position_ids, text_position_ids], dim=1)
+
+                # get prune ratio
+                ratio = mask.float().mean().item()  # mask is already boolean
 
             # XXX: maybe a instrumentation class is better
             instrument = {
@@ -277,7 +297,7 @@ class ATPModule(nn.Module):
                 'theta_r': theta_r.mean().item(),
                 'theta_s': theta_s.mean().item(),
                 'num_vision_token': pruned_vision_tokens.shape[1],
-                'kept_token_ratio': (mask > 0.5).float().mean().item()
+                'kept_token_ratio': ratio
             }
 
             hidden_states = torch.cat([pruned_vision_tokens, text_tokens], dim=1)
@@ -294,9 +314,16 @@ class PruningContext():
     """
     Shared context for all decoder layers
     """
+    # initial vision tokens
+    _MAX_VISION_TOKENS = 576
+
     def __init__(self, num_layers):
+        self.num_layers = num_layers
+        self.reset()
+
+    def reset(self):
         # NOTE: extra slot to prevent boundary check
-        self.num_vision_token = [[] for _ in range(num_layers+1)]
+        self.num_vision_token = [self._MAX_VISION_TOKENS] * (self.num_layers + 1)
         self.mask = None
 
 class MyDecoderLayer(LlamaDecoderLayer):
@@ -336,6 +363,8 @@ class MyDecoderLayer(LlamaDecoderLayer):
 
     # Apply the pruning mask before attention
     def apply_pruning_mask(self, attention_mask, hidden_states):
+        # TODO: this is problematic, not sure it matches the
+        #       design of the paper though
         if self.training and self.context.mask is not None:
             if attention_mask is None:
                 attention_mask = torch.zeros(
@@ -435,6 +464,13 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
             [MyDecoderLayer(config, i, self.pruning_context)
              for i in range(config.num_hidden_layers)]
         )
+
+    def forward(self, *args, **kwargs):
+        # reset pruning state at each forward pass
+        self.pruning_context.reset()
+
+        # invoke parent's forward
+        return super().forward(*args, **kwargs)
 
 
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
