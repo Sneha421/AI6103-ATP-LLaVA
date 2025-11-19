@@ -52,9 +52,16 @@ class ATPModule(nn.Module):
         # ... make it a trainable hyperparameter
         self.register_buffer('T', torch.tensor(temperature))
 
+        # AdaptiveAvgPool1d will turn any input size vector into fixed-size feature vectors
+        self.feature_dim = 256
+
+        # [B, 1, L_v] -> [B, 1, feature_dim]
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(self.feature_dim)
+
+
         # MLP to get theta scalars with linear transformation
         self.shared_fc = nn.Sequential(
-            nn.Linear(num_vision_tokens * 2, 256),
+            nn.Linear(self.feature_dim * 2, 256),
             nn.ReLU()
         )
 
@@ -97,7 +104,7 @@ class ATPModule(nn.Module):
         # for each vision token, compute the average attention it
         #   receives from the other vision tokens
         # [B, H, L_v, L_v] -> mean over heads and keys -> [B, L_v]
-        S_self = self_attn_map.mean(dim=(1, 3))
+        S_self = self_attn_map.mean(dim=(1, 2))
 
         # 3. compute S_cross (4)
         # For each vision token, compute the average attention it
@@ -152,12 +159,15 @@ class ATPModule(nn.Module):
             theta_r: [B, 1]
             theta_s: [B, 1]
         """
-        # z = Linear(concat(S_self, S_cross)) (6)
-        score_features = torch.cat([S_self, S_cross], dim=-1)  # [B, 2*L_v]
+        # Transform variable-size inputs to fixed size for stable training [B, L_v] → [B, feature_dim]
+        S_self_pooled = self.adaptive_pool(S_self.unsqueeze(1)).squeeze(1)    # [B, 256] 
+        S_cross_pooled = self.adaptive_pool(S_cross.unsqueeze(1)).squeeze(1)  # [B, 256]
+
+        # z = Linear(concat(S_self_pooled, S_cross_pooled)) (6) - scores after adaptive pooling
+        score_features = torch.cat([S_self_pooled, S_cross_pooled], dim=-1)  # [B, 512]
 
         # shared features
-        # TODO: score_features can have dimension mismatch
-        shared_features = self.shared_fc(score_features)  # [B, 2*L_v] -> [B, 256]
+        shared_features = self.shared_fc(score_features)  # [B, 512] -> [B, 256]
 
         # two-head predictors (7) (8)
         theta_r = self.head_redundant(shared_features)  # [B, 256] -> [B, 1]
