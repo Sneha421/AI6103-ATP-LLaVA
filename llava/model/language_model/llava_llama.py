@@ -550,22 +550,6 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
 
-        # initializing the shared context
-        self.pruning_context = PruningContext(config.num_hidden_layers)
-
-        # replace all layers with Llama custom layers
-        self.layers = nn.ModuleList(
-            [MyDecoderLayer(config, i, self.pruning_context)
-             for i in range(config.num_hidden_layers)]
-        )
-
-    def forward(self, *args, **kwargs):
-        # reset pruning state at each forward pass
-        self.pruning_context.reset()
-
-        # invoke parent's forward
-        return super().forward(*args, **kwargs)
-
 
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
