@@ -279,12 +279,15 @@ class ATPModule(nn.Module):
                 ratio = mask.float().mean().item()  # For soft mask
             else:
                 # hard prune
-                kept_indices = mask.nonzero(as_tuple=True)[1]
-                pruned_vision_tokens = vision_tokens[:, kept_indices]
+                for b in range(batch_size):
+                    batch_mask = mask[b]  # [num_vision_tokens]
+                    kept_indices_b = batch_mask.nonzero(as_tuple=True)[0]
+                    pruned_vision_tokens[b] = vision_tokens[b, kept_indices_b]
+                
 
                 # preserve original position IDs
                 if position_ids is not None:
-                    pruned_position_ids = vision_position_ids[:, kept_indices]
+                    pruned_position_ids = vision_position_ids[:, kept_indices_b]
                     position_ids = torch.cat([pruned_position_ids, text_position_ids], dim=1)
                 
 
