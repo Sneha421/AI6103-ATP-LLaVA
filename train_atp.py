@@ -12,11 +12,11 @@ from transformers import (
     LlamaModel
 )
 from torch.optim import AdamW
+from llava.model import LlavaConfig
 from llava.model.language_model.llava_llama import (
     PruningContext,
     MyDecoderLayer,
-    LlavaLlamaModel,
-    LlavaConfig
+    LlavaLlamaModel
 )
 from llava.model.multimodal_encoder.builder import build_vision_tower
 from llava.model.multimodal_projector.builder import build_vision_projector
