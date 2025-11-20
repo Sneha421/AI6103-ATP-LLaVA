@@ -240,6 +240,19 @@ def main():
 
     # Load config and create ATP model
     config = LlavaConfig.from_pretrained(args.model_name_or_path)
+
+    # CRITICAL FIX: Ensure vision tower config exists
+    # This is the standard LLaVA-1.5 CLIP ViT-L/14-336px model
+    if not hasattr(config, 'mm_vision_tower') or config.mm_vision_tower is None:
+        config.mm_vision_tower = "openai/clip-vit-large-patch14-336"
+        print(f"Warning: mm_vision_tower not in config. Setting to: {config.mm_vision_tower}")
+
+    # Add other required LLaVA config parameters if missing
+    if not hasattr(config, 'mm_hidden_size'):
+        config.mm_hidden_size = 1024  # CLIP ViT-L hidden size
+    if not hasattr(config, 'mm_projector_type'):
+        config.mm_projector_type = 'mlp2x_gelu'  # Standard LLaVA projector
+
     config.target_tokens = args.target_tokens
 
     # Load model with pre-trained weights
@@ -319,15 +332,15 @@ def main():
 
     print("ATP-LLaVA fine-tuning complete!")
 
-
-# Example command:
-# python train_atp.py \
-#     --model_name_or_path "./models/llava-v1.5-7b" \
-#     --data_path "./playground/data/llava_v1_5_mix665k.json" \
-#     --output_dir "./checkpoints/atp-llava-7b" \
-#     --num_epochs 1 \
-#     --per_device_train_batch_size 4 \
-#     --target_tokens 144
+'''
+python train_atp.py \
+    --model_name_or_path "./llava/model" \
+    --data_path "./playground/data/llava_v1_5_mix665k.json" \
+    --output_dir "./checkpoints/atp-llava-7b" \
+    --num_epochs 1 \
+    --per_device_train_batch_size 4 \
+    --target_tokens 144
+'''
 
 if __name__ == "__main__":
     main()
