@@ -8,7 +8,8 @@ import torch.nn.functional as F
 from transformers import (
     TrainingArguments,
     Trainer,
-    AutoTokenizer
+    AutoTokenizer,
+    LlamaModel
 )
 from torch.optim import AdamW
 from llava.model.language_model.llava_llama import (
