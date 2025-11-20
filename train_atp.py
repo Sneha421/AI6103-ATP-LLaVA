@@ -142,6 +142,7 @@ def main():
                        default="liuhaotian/llava-v1.5-7b",
                        help="HuggingFace model ID")
     parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--image_folder", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--per_device_train_batch_size", type=int, default=4)
