@@ -61,7 +61,7 @@ class ATP_LlavaLlamaModelWrapper:
 
         for i, original_layer in enumerate(original_layers):
             atp_layer = MyDecoderLayer(model.config, i, model.pruning_context)
-            atp_layer.load_state_dict(original_layer.state_dict(), strict=True)
+            atp_layer.load_state_dict(original_layer.state_dict(), strict=False)
             new_layers.append(atp_layer)
 
         model.layers = new_layers  # model.layers
@@ -168,7 +168,7 @@ def main():
 
     # Load tokenizer first (required for data module)
     print(f"Loading tokenizer from {args.model_name_or_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=False)
 
     # Create data arguments
     data_args = DataArguments(
