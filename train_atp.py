@@ -21,6 +21,11 @@ from llava.model.language_model.llava_llama import (
 from llava.train.train import DataArguments, make_supervised_data_module
 
 # =============================================================================
+# Disable FutureWarnings
+# =============================================================================
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# =============================================================================
 # ATP-LLaVA Model Wrapper
 # =============================================================================
 
