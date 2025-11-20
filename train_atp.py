@@ -18,16 +18,15 @@ from llava.model.language_model.llava_llama import (
     MyDecoderLayer,
     LlavaLlamaModel,
 )
-from llava.train.train import make_supervised_data_module
+from llava.train.train import DataArguments, make_supervised_data_module
 
 # =============================================================================
-# ATP-LLaVA Model Wrapper (No Inheritance = No Warnings)
+# ATP-LLaVA Model Wrapper
 # =============================================================================
 
 class ATP_LlavaLlamaModelWrapper:
     """
     Wrapper class that takes a loaded LlavaLlamaModel and injects ATP modules.
-    This completely bypasses model_type warnings by not inheriting from LlamaModel.
     """
 
     @staticmethod
@@ -56,7 +55,6 @@ class ATP_LlavaLlamaModelWrapper:
 
     @staticmethod
     def _inject_atp_modules(model):
-        """CRITICAL: Access layers via model.layers, not model.model.layers"""
         print(f"Injecting ATP modules into {len(model.layers)} decoder layers...")
         original_layers = model.layers
         new_layers = nn.ModuleList()
@@ -155,22 +153,43 @@ def main():
     parser.add_argument("--report_to", type=str, default="tensorboard")
     args = parser.parse_args()
 
+    # print configurations
+    print("\n" + "="*80)
+    print("ATP-LLaVA Training Configuration")
+    print("="*80)
+    print(f"Model: {args.model_name_or_path}")
+    print(f"Data: {args.data_path}")
+    print(f"Images: {args.image_folder}")
+    print(f"Output: {args.output_dir}")
+    print(f"Target tokens: {args.target_tokens}")
+    print(f"LLM LR: {args.learning_rate}, ATP LR: {args.atp_learning_rate}")
+    print("="*80 + "\n")
+
+    # Load tokenizer first (required for data module)
+    print(f"Loading tokenizer from {args.model_name_or_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+
+    # Create data arguments
+    data_args = DataArguments(
+        data_path=args.data_path,
+        image_folder=args.image_folder,
+        lazy_preprocess=True,
+    )
+
     print(f"Loading model from {args.model_name_or_path}...")
     model = ATP_LlavaLlamaModelWrapper.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
     )
 
-    # model.layers, not model.model.layers
     atp_params = sum(p.numel() for layer in model.layers
                      if hasattr(layer, 'pruner') and layer.pruner
                      for p in layer.pruner.parameters())
     print(f"ATP module parameters: {atp_params:,} (trainable)")
 
-    # Prepare data
-    data_module = make_supervised_data_module(args)
+    # load data
+    data_module = make_supervised_data_module(tokenizer, data_args)
 
-    # model.layers instead of model.model.layers
     atp_param_list = [p for layer in model.layers
                       if hasattr(layer, 'pruner') and layer.pruner
                       for p in layer.pruner.parameters()]
