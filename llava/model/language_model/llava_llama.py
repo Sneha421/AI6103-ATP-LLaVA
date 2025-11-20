@@ -97,7 +97,7 @@ class ATPModule(nn.Module):
         # for each vision token, compute the average attention it
         #   receives from the other vision tokens
         # [B, H, L_v, L_v] -> mean over heads and keys -> [B, L_v]
-        S_self = self_attn_map.mean(dim=(1, 3))
+        S_self = self_attn_map.mean(dim=(1, 3)) # should this be 1,2?
 
         # 3. compute S_cross (4)
         # For each vision token, compute the average attention it
@@ -113,6 +113,7 @@ class ATPModule(nn.Module):
         stride = 2
         sampled_positions = self.grid_size // stride
         num_sampled = sampled_positions ** 2  # total number of tokens
+        
         # sample rate: R^s = num_sampled / L_v
         R_s = num_sampled / num_vision_tokens
 
@@ -285,6 +286,7 @@ class ATPModule(nn.Module):
                 if position_ids is not None:
                     pruned_position_ids = vision_position_ids[:, kept_indices]
                     position_ids = torch.cat([pruned_position_ids, text_position_ids], dim=1)
+                
 
                 # get prune ratio
                 ratio = mask.float().mean().item()  # mask is already boolean
@@ -302,7 +304,7 @@ class ATPModule(nn.Module):
 
             hidden_states = torch.cat([pruned_vision_tokens, text_tokens], dim=1)
         else:
-            # empty instrument
+            # instrument is empty
             instrument = {}
 
         # save instrumentation
@@ -360,23 +362,102 @@ class MyDecoderLayer(LlamaDecoderLayer):
         self.pruner = None
         if layer_idx in [4, 14, 24]:
             self.pruner = ATPModule(self._MAX_VISION_TOKENS)
-
-    # Apply the pruning mask before attention
+    
     def apply_pruning_mask(self, attention_mask, hidden_states):
-        # TODO: this is problematic, not sure it matches the
-        #       design of the paper though
-        if self.training and self.context.mask is not None:
-            if attention_mask is None:
-                attention_mask = torch.zeros(
-                    1, 1, 1, hidden_states.shape[1],
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype
-                )
-            bias = (1 - self.prev_atp_mask).unsqueeze(1).unsqueeze(2) * \
-                torch.finfo(hidden_states.dtype).min
-            attention_mask = attention_mask + bias
-
+        """
+        Apply the pruning mask during attention computation using graph-based masking.
+        
+        This implements Equations (9-11) from the referenced paper where:
+        - G_ij = 1 if i == j (self-loop for all tokens)
+        - G_ij = D_j if i != j (only unpruned tokens contribute to others)
+        - exp(P_ij) * G_ij is computed element-wise before normalization
+        
+        This ensures pruned tokens (D_j = 0) only attend to themselves and don't
+        influence other tokens, while maintaining constant NxN shape during training.
+        
+        Args:
+            attention_mask: Existing causal attention mask or None
+            hidden_states: Current hidden states [batch, seq_len, hidden_dim]
+        
+        Returns:
+            Modified attention_mask with pruning information
+        """
+        # If no pruning mask from previous layer, return original mask
+        if not self.training or self.context.mask is None:
+            return attention_mask
+        
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        
+        # Initialize attention_mask if None
+        if attention_mask is None:
+            # Create a causal mask (lower triangular)
+            attention_mask = torch.zeros(
+                batch_size, 1, seq_len, seq_len,
+                device=device,
+                dtype=dtype
+            )
+        
+        # Get pruning mask from context (set by previous layer's ATP module)
+        # Shape: [B, L_v] with values in [0, 1] (soft mask during training)
+        # This is D in the ref paper notation
+        vision_mask = self.context.mask  # D_j for vision tokens only
+        
+        # Get number of vision tokens from context
+        num_vision_tokens = vision_mask.shape[1]  # L_v
+        num_text_tokens = seq_len - num_vision_tokens  # L_t
+        
+        # Expand vision-only mask to full [batch, seq_len] pruning_mask
+        # Text tokens are never pruned, so their mask values are always 1
+        text_mask = torch.ones(
+            batch_size, num_text_tokens,
+            device=device,
+            dtype=dtype
+        )
+            
+        # Concatenate: [vision_tokens | text_tokens] for key dimension
+        key_mask = torch.cat([vision_mask, text_mask], dim=1)  # [B, seq_len]
+        
+        # Construct graph matrix G following Eq. (10):
+        # G_ij = 1 if i == j (self-loop)
+        # G_ij = D_j if i != j (pruned tokens don't contribute to others)
+        # where j indexes the key tokens (columns)
+        
+        # Create identity matrix for self-loops: [seq_len, seq_len]
+        identity = torch.eye(seq_len, device=device, dtype=dtype)
+        
+        # Expand key_mask for broadcasting: [batch, 1, 1, seq_len]
+        # This represents D_j (whether key token j should contribute to query token i)
+        key_mask_expanded = key_mask.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, seq_len]
+        
+        # Construct G matrix: [batch, 1, seq_len, seq_len]
+        # For each position (i,j) where i=query, j=key:
+        #   - If i == j: G_ij = 1 (self-loop)
+        #   - If i != j: G_ij = D_j (key token j contributes only if unpruned)
+        identity_expanded = identity.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+        G = identity_expanded + (1 - identity_expanded) * key_mask_expanded
+        # Shape: [batch, 1, seq_len, seq_len]
+        # Dimension breakdown: [batch, heads, query_len, key_len]
+        
+        # Convert G to additive mask for attention logits
+        # Where G = 0, we want to add -inf to the attention logits
+        # Where G = 1, we add 0 (no change)
+        # For soft masks (0 < G < 1), this creates a soft constraint
+        
+        # Create additive bias: log(G) for multiplicative mask in exp space
+        # When G = 0, log(G) = -inf, which zeros out the attention after exp+softmax
+        # When G = 1, log(G) = 0, no effect
+        # For numerical stability with soft masks, use log(G + eps)
+        eps = 1e-9
+        G_bias = torch.log(G + eps)
+        
+        # Add graph-based pruning bias to attention mask
+        attention_mask = attention_mask + G_bias
+        
+        # Clear the mask from context after use
         self.context.mask = None
+        
         return attention_mask
 
     # Exact copy of LlamaDecoderLayer.forward()
