@@ -276,8 +276,8 @@ class ATPModule(nn.Module):
             )
 
             # 3.3.2 part II: generate masks
-            mask, mask_r, mask_s = self.generate_masks(
-                redundant_score, spatial_score, theta_r, theta_s
+            mask_r, mask_s, mask = self.generate_masks(
+                redundant_score, spatial_score, theta_r, theta_s, is_training
             )
 
             # Apply masks
@@ -347,7 +347,8 @@ class MyDecoderLayer(LlamaDecoderLayer):
     """
 
     # minimal transformer version
-    _MINIMAL_VERSION = "4.40.0"
+    _MINIMAL_VERSION = "4.37.2"
+    print("Transformer version", __transformer_version__)
 
     # initial vision tokens
     _MAX_VISION_TOKENS = 576
@@ -477,13 +478,13 @@ class MyDecoderLayer(LlamaDecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        use_cache=False,
-        cache_position=None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
         **kwargs
-    ) -> torch.Tensor:
+    ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -492,16 +493,32 @@ class MyDecoderLayer(LlamaDecoderLayer):
             attention_mask, hidden_states
         )
 
+        # For layers with pruners, we need attention weights
+        need_attention_weights = output_attentions or (self.pruner is not None)
+
         # continue with transformer attention
-        hidden_states, attn_weights = self.self_attn(
+        # Extract past_key_value for this layer from past_key_values tuple
+        past_key_value = past_key_values[self.layer_idx] if past_key_values is not None else None
+        
+        # Filter out conflicting arguments from kwargs
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ['past_key_value', 'past_key_values']}
+        
+        attn_output = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            past_key_value=past_key_value,
+            output_attentions=need_attention_weights,
             use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
+            **filtered_kwargs,
         )
+        
+        # Xformers attention always returns 3 values: (hidden_states, attn_weights, present_key_value)
+        # But attn_weights can be None if output_attentions=False
+        hidden_states = attn_output[0]
+        attn_weights = attn_output[1] if len(attn_output) > 1 else None  
+        present_key_value = attn_output[2] if len(attn_output) > 2 else None
+
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -524,20 +541,37 @@ class MyDecoderLayer(LlamaDecoderLayer):
                 num_vision_tokens=num_vision_tokens,
                 is_training=self.training
             )
-
+                
             # update next layer's number of vision tokens
-            self.context.num_vision_token[self.layer_idx + 1] = (
-                instrument['num_vision_token']
-            )
+            if 'num_vision_token' in instrument:
+                self.context.num_vision_token[self.layer_idx + 1] = (
+                    instrument['num_vision_token']
+                )
+            else:
+                # Fallback: no pruning occurred, keep original count
+                self.context.num_vision_token[self.layer_idx + 1] = num_vision_tokens
 
             # while training, pass the mask to next layer
-            if self.training:
+            if self.training and 'mask' in instrument:
                 self.context.mask = instrument['mask']
         else:
             # the vision token never pruned
             self.context.num_vision_token[self.layer_idx + 1] = num_vision_tokens
 
-        return hidden_states
+        # Return format should match LlamaDecoderLayer exactly
+        outputs = (hidden_states,)
+        
+        if use_cache:
+            # Always include cache when requested, even if None
+            # This maintains consistency with the transformer's cache system
+            outputs += (present_key_value,)
+            
+        if output_attentions:
+            # Only include attention weights if explicitly requested by the user
+            # (not just because we needed them for pruning)
+            outputs += (attn_weights,)
+            
+        return outputs
 
 
 class LlavaConfig(LlamaConfig):
@@ -654,12 +688,11 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             **kwargs
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
-                                      inputs_embeds=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)
         image_sizes = kwargs.pop("image_sizes", None)
         inputs = super().prepare_inputs_for_generation(
-            input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
+            input_ids, inputs_embeds=inputs_embeds, **kwargs
         )
         if images is not None:
             inputs['images'] = images
